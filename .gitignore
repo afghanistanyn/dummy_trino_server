@@ -1,0 +1,9 @@
+vendor
+logs
+.idea
+.vscode
+*.exe
+vendor/
+tests/
+profiles/
+data/
