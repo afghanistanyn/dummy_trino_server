@@ -21,6 +21,7 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/gofiber/fiber/v2"
 	fiberlogger "github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 	jsoniter "github.com/json-iterator/go"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -452,6 +453,7 @@ func main() {
 		WriteTimeout:    5 * time.Minute,
 		WriteBufferSize: 10 * 1024 * 1024,
 	})
+	app.Use(recover.New())
 	app.Use(fiberlogger.New(fiberlogger.Config{
 		TimeFormat: "2006-01-02 15:04:05.000000",
 	}))
