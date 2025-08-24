@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/md5"
 	"crypto/sha256"
 	"encoding/csv"
 	"encoding/hex"
@@ -20,8 +19,8 @@ import (
 	_ "net/http/pprof"
 
 	"github.com/dustin/go-humanize"
-	"github.com/gin-contrib/zap"
-	"github.com/gin-gonic/gin"
+	"github.com/gofiber/fiber/v2"
+	fiberlogger "github.com/gofiber/fiber/v2/middleware/logger"
 	jsoniter "github.com/json-iterator/go"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -73,7 +72,7 @@ type (
 	}
 	queryShard struct {
 		mu sync.RWMutex
-		m  map[string]QueryState
+		m  map[string]*QueryState
 	}
 	QueryStateMap struct {
 		shards [shardCount]queryShard
@@ -89,27 +88,6 @@ type (
 		ExecutingStatementTpls              []RespTemplate
 	}
 )
-
-func md5sum(data [][]string) string {
-	h := md5.New()
-	if len(data) == 0 {
-		h.Write([]byte("empty"))
-	} else {
-		for _, col := range data[0] {
-			h.Write([]byte(col))
-			h.Write([]byte{0})
-		}
-		h.Write([]byte{1})
-		if len(data) > 1 {
-			for _, col := range data[len(data)-1] {
-				h.Write([]byte(col))
-				h.Write([]byte{0})
-			}
-			h.Write([]byte{1})
-		}
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
 
 func genQueryID() string {
 	querySeq := atomic.AddUint64(&metrics.TotalQueries, 1)
@@ -163,6 +141,27 @@ func loadAndChunkCSV(dataFile string, chunkSize int) error {
 	return nil
 }
 
+func md5sum(data [][]string) string {
+	h := sha256.New()
+	if len(data) == 0 {
+		h.Write([]byte("empty"))
+	} else {
+		for _, col := range data[0] {
+			h.Write([]byte(col))
+			h.Write([]byte{0})
+		}
+		h.Write([]byte{1})
+		if len(data) > 1 {
+			for _, col := range data[len(data)-1] {
+				h.Write([]byte(col))
+				h.Write([]byte{0})
+			}
+			h.Write([]byte{1})
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 func cacheChunkJSON() error {
 	chunkJSON = make([]jsoniter.RawMessage, len(chunks))
 	for i, chunk := range chunks {
@@ -175,9 +174,9 @@ func cacheChunkJSON() error {
 	return nil
 }
 
-func parseQueryClient(c *gin.Context) string {
+func parseQueryClient(c *fiber.Ctx) string {
 	for _, h := range []string{HeaderClientInfo, HeaderSource, HeaderUa} {
-		if v := c.GetHeader(h); v != "" {
+		if v := c.Get(h); v != "" {
 			return v
 		}
 	}
@@ -209,17 +208,14 @@ func buildResponseCaches() error {
 	if err != nil {
 		return err
 	}
-	// NewStatement
 	rawNew := fmt.Sprintf(
 		`{"id":"%s","infoUri":"http://%s/v1/admin/status/%s","nextUri":"http://%s/v1/statement/queued/%s/%s/1","columns":%s,"stats":{"state":"QUEUED","queued":true,"scheduled":true},"warning":{"message":""}}`,
 		QueryIDPlaceholder, externalHost, QueryIDPlaceholder, externalHost, QueryIDPlaceholder, chunkHashes[0], columnsJSON)
 	responseCaches.NewStatementTpl = buildRespTemplate(rawNew)
-	// QueuedStatement
 	rawQueued := fmt.Sprintf(
 		`{"id":"%s","infoUri":"http://%s/v1/admin/status/%s","nextUri":"http://%s/v1/statement/executing/%s/%s/0","columns":%s,"stats":{"state":"RUNNING","queued":false,"scheduled":true},"warning":{"message":""}}`,
 		QueryIDPlaceholder, externalHost, QueryIDPlaceholder, externalHost, QueryIDPlaceholder, chunkHashes[0], columnsJSON)
 	responseCaches.QueuedStatementTpl = buildRespTemplate(rawQueued)
-	// ExecutingStatement
 	responseCaches.ExecutingStatementTpls = make([]RespTemplate, len(chunks)+1)
 	for i := 0; i <= len(chunks); i++ {
 		var dataJSON string
@@ -240,36 +236,30 @@ func buildResponseCaches() error {
 	return nil
 }
 
-func handleNewQuery(c *gin.Context) {
+func handleNewQuery(c *fiber.Ctx) error {
 	queryID := genQueryID()
 	queryClient := parseQueryClient(c)
-	body, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		logger.Error("Failed to read request body", zap.Error(err))
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
-		return
-	}
+	body := c.Body()
 	query := string(body)
 	logger.Info("Received new query", zap.String("query_id", queryID), zap.String("client", queryClient), zap.String("query", query))
-	qs := QueryState{Client: queryClient, Query: query, State: "QUEUED", StartTime: time.Now(), LastActiveTime: time.Now()}
+	qs := &QueryState{Client: queryClient, Query: query, State: "QUEUED", StartTime: time.Now(), LastActiveTime: time.Now()}
 	queryStates.Set(queryID, qs)
 	atomic.AddUint64(&metrics.RunningQueries, 1)
 	respBytes := renderResp(responseCaches.NewStatementTpl, queryID)
-	c.Data(200, "application/json", respBytes)
+	return c.Status(200).Type("application/json").Send(respBytes)
 }
 
-func handleQueryNextChunk(c *gin.Context) {
-	queryID := c.Param("query_id")
-	chunkIndex, _ := strconv.Atoi(c.Param("chunk_idx"))
+func handleQueryNextChunk(c *fiber.Ctx) error {
+	queryID := c.Params("query_id")
+	chunkIndex, _ := strconv.Atoi(c.Params("chunk_idx"))
 	qs, ok := queryStates.Get(queryID)
-	if !ok {
+	if !ok || qs == nil {
 		logger.Warn("Query not found", zap.String("query_id", queryID))
-		c.JSON(http.StatusNotFound, gin.H{"error": "query not found"})
-		return
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "query not found"})
 	}
+
 	if chunkIndex >= len(chunks) && qs.State != "QUEUED" {
 		qs.State, qs.EndTime, qs.ChunkIndex, qs.LastActiveTime = "FINISHED", time.Now(), chunkIndex, time.Now()
-		queryStates.Set(queryID, qs)
 		atomic.AddUint64(&metrics.RunningQueries, ^uint64(0))
 		completedQueriesLogChan <- map[string]interface{}{
 			"query_id": queryID, "query": qs.Query, "client": qs.Client,
@@ -277,22 +267,18 @@ func handleQueryNextChunk(c *gin.Context) {
 		}
 		logger.Info("Query finished", zap.String("query_id", queryID))
 		respBytes := renderResp(responseCaches.ExecutingStatementTpls[chunkIndex], queryID)
-		c.Data(200, "application/json", respBytes)
-		return
+		return c.Status(200).Type("application/json").Send(respBytes)
 	}
 	if qs.State == "QUEUED" {
 		qs.State, qs.LastActiveTime = "RUNNING", time.Now()
-		queryStates.Set(queryID, qs)
 		logger.Info("Query state changed to RUNNING", zap.String("query_id", queryID))
 		respBytes := renderResp(responseCaches.QueuedStatementTpl, queryID)
-		c.Data(200, "application/json", respBytes)
-		return
+		return c.Status(200).Type("application/json").Send(respBytes)
 	}
 	qs.ChunkIndex, qs.State = chunkIndex+1, "RUNNING"
-	queryStates.Set(queryID, qs)
 	respBytes := renderResp(responseCaches.ExecutingStatementTpls[chunkIndex], queryID)
-	c.Data(200, "application/json", respBytes)
 	logger.Info("Query chunk served", zap.String("query_id", queryID), zap.Int("chunk_index", chunkIndex))
+	return c.Status(200).Type("application/json").Send(respBytes)
 }
 
 func QueryManagement(interval, expireAfter, runningExpireAfter time.Duration) {
@@ -300,16 +286,19 @@ func QueryManagement(interval, expireAfter, runningExpireAfter time.Duration) {
 	go func() {
 		for range ticker.C {
 			now := time.Now()
-			queryStates.Range(func(queryID string, qs QueryState) bool {
+			queryStates.Range(func(queryID string, qs *QueryState) bool {
+				shard := queryStates.getShard(queryID)
+				shard.mu.Lock()
 				switch {
 				case qs.State == "FINISHED" && now.Sub(qs.EndTime) > expireAfter:
-					queryStates.Delete(queryID)
+					delete(shard.m, queryID)
 					logger.Info("Expired FINISHED query cleaned", zap.String("query_id", queryID))
 				case qs.State == "RUNNING" && now.Sub(qs.LastActiveTime) > runningExpireAfter:
-					queryStates.Delete(queryID)
+					delete(shard.m, queryID)
 					atomic.AddUint64(&metrics.RunningQueries, ^uint64(0))
 					logger.Info("Stuck RUNNING query cleaned", zap.String("query_id", queryID))
 				}
+				shard.mu.Unlock()
 				return true
 			})
 		}
@@ -344,32 +333,30 @@ func QueryIDDateTimeCache() {
 	}()
 }
 
-func handleQueryStatus(c *gin.Context) {
-	queryID := c.Param("query_id")
+func handleQueryStatus(c *fiber.Ctx) error {
+	queryID := c.Params("query_id")
 	qs, ok := queryStates.Get(queryID)
-	if !ok {
+	if !ok || qs == nil {
 		logger.Warn("Query not found (status)", zap.String("query_id", queryID))
-		c.JSON(http.StatusNotFound, gin.H{"error": "query not found"})
-		return
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "query not found"})
 	}
 	jsonBytes, _ := jsoniter.Marshal(qs)
-	c.Data(http.StatusOK, "application/json", jsonBytes)
+	return c.Status(200).Type("application/json").Send(jsonBytes)
 }
 
-func handleQueryAllStatus(c *gin.Context) {
+func handleStatus(c *fiber.Ctx) error {
 	resp := map[string]interface{}{
-		"uptime":  time.Since(startTime).String(),
-		"queries": queryStates,
-		"status":  metrics,
+		"uptime": time.Since(startTime).String(),
+		"status": metrics,
 	}
 	jsonBytes, _ := jsoniter.Marshal(resp)
-	c.Data(http.StatusOK, "application/json", jsonBytes)
+	return c.Status(200).Type("application/json").Send(jsonBytes)
 }
 
 func NewQueryStateMap() *QueryStateMap {
 	qsm := &QueryStateMap{}
 	for i := 0; i < shardCount; i++ {
-		qsm.shards[i].m = make(map[string]QueryState)
+		qsm.shards[i].m = make(map[string]*QueryState)
 	}
 	return qsm
 }
@@ -379,20 +366,20 @@ func (qsm *QueryStateMap) getShard(key string) *queryShard {
 	h.Write([]byte(key))
 	return &qsm.shards[uint(h.Sum32())%shardCount]
 }
-func (qsm *QueryStateMap) Get(key string) (QueryState, bool) {
+func (qsm *QueryStateMap) Get(key string) (*QueryState, bool) {
 	shard := qsm.getShard(key)
 	shard.mu.RLock()
 	v, ok := shard.m[key]
 	shard.mu.RUnlock()
 	return v, ok
 }
-func (qsm *QueryStateMap) Set(key string, value QueryState) {
+func (qsm *QueryStateMap) Set(key string, value *QueryState) {
 	shard := qsm.getShard(key)
 	shard.mu.Lock()
 	shard.m[key] = value
 	shard.mu.Unlock()
 }
-func (qsm *QueryStateMap) Range(f func(key string, value QueryState) bool) {
+func (qsm *QueryStateMap) Range(f func(key string, value *QueryState) bool) {
 	for i := 0; i < shardCount; i++ {
 		shard := &qsm.shards[i]
 		shard.mu.RLock()
@@ -412,7 +399,7 @@ func (qsm *QueryStateMap) Delete(key string) {
 	shard.mu.Unlock()
 }
 
-func handleMetrics(c *gin.Context) {
+func handleMetrics(c *fiber.Ctx) error {
 	metricsText := fmt.Sprintf(`# TYPE trino_execution_name_QueryManager_RunningQueries gauge
 trino_execution_name_QueryManager_RunningQueries %d
 
@@ -424,8 +411,8 @@ trino_metadata_name_DiscoveryNodeManager_ActiveNodeCount %d
 
 # EOF
 `, metrics.RunningQueries, metrics.QueuedQueries, metrics.NodesCount)
-	c.Header("Content-Type", "application/openmetrics-text; version=1.0.0; charset=utf-8")
-	c.String(http.StatusOK, metricsText)
+	c.Set("Content-Type", "application/openmetrics-text; version=1.0.0; charset=utf-8")
+	return c.Status(200).SendString(metricsText)
 }
 
 func main() {
@@ -459,21 +446,29 @@ func main() {
 	QueryIDDateTimeCache()
 	QueryManagement(30*time.Second, 120*time.Second, 300*time.Second)
 
-	gin.SetMode(gin.ReleaseMode)
-	r := gin.New()
-	r.Use(ginzap.Ginzap(logger, time.RFC3339, true), ginzap.RecoveryWithZap(logger, true))
-	r.POST("/v1/statement", handleNewQuery)
-	r.GET("/v1/statement/:status(executing|queued)/:query_id/:token/:chunk_idx", handleQueryNextChunk)
-	r.GET("/v1/metrics", handleMetrics)
-	r.GET("/v1/admin/status/:query_id", handleQueryStatus)
-	r.GET("/v1/admin/status", handleQueryAllStatus)
+	app := fiber.New(fiber.Config{
+		AppName:         "dummy_trino",
+		ServerHeader:    "dummy_trino",
+		WriteTimeout:    5 * time.Minute,
+		WriteBufferSize: 10 * 1024 * 1024,
+	})
+	app.Use(fiberlogger.New(fiberlogger.Config{
+		TimeFormat: "2006-01-02 15:04:05.000000",
+	}))
+
+	app.Post("/v1/statement", handleNewQuery)
+	app.Get("/v1/statement/:status(executing|queued)/:query_id/:token/:chunk_idx", handleQueryNextChunk)
+	app.Get("/v1/metrics", handleMetrics)
+	app.Get("/v1/admin/status/:query_id", handleQueryStatus)
+	app.Get("/v1/admin/status", handleStatus)
 
 	startTime = time.Now()
 	serverPortHash = fmt.Sprintf("%x", sha256.Sum256([]byte(strconv.Itoa(serverPort))))[:4]
 	logger.Info("Server starting", zap.Int("port", serverPort))
 
 	go http.ListenAndServe(":6060", nil) // for pprof
-	err := r.Run(fmt.Sprintf(":%d", serverPort))
+
+	err := app.Listen(fmt.Sprintf(":%d", serverPort))
 	if err != nil {
 		logger.Fatal("Failed to start server", zap.Error(err))
 	}

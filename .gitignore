@@ -7,3 +7,4 @@ vendor/
 tests/
 profiles/
 data/
+trino_server2.go
